@@ -257,6 +257,45 @@ async function solveTurnstileIfPresent(page, stageName = "通用", maxAttempts =
     return false;
 }
 
+// --- 业务状态判断：还没到可续期日期就停止重试 ---
+// 目的：把 KataBump 返回的“还没到续期时间”识别为 skipped，而不是当成临时失败反复刷新。
+async function detectNotYetRenewable(page) {
+    const text = await page.evaluate(() => document.body.innerText || "").catch(() => "");
+    if (!text) return null;
+
+    const normalized = text.replace(/\s+/g, " ").trim();
+    const matched = normalized.match(/You can't renew your server yet[\s\S]{0,180}?(?:day\(s\)|days?|\.)/i);
+    if (matched) return matched[0].trim();
+
+    if (/You can't renew your server yet/i.test(normalized) || /You will be able to as of/i.test(normalized)) {
+        const lines = text
+            .split("\n")
+            .map(s => s.trim())
+            .filter(Boolean);
+        const line = lines.find(s => /You can't renew your server yet/i.test(s) || /You will be able to as of/i.test(s));
+        return line || "You can't renew your server yet";
+    }
+
+    return null;
+}
+
+async function stopRetryIfNotYetRenewable(page, modal = null) {
+    const message = await detectNotYetRenewable(page);
+    if (!message) return false;
+
+    console.log('   >> ⏳ 暂无法续期，停止重试。');
+    console.log('   >> 页面提示:', message);
+
+    if (modal) {
+        try {
+            const closeBtn = modal.getByLabel('Close');
+            if (await closeBtn.isVisible({ timeout: 1000 })) await closeBtn.click();
+        } catch (e) { }
+    }
+
+    return true;
+}
+
 
 (async () => {
     const users = getUsers();
@@ -393,8 +432,21 @@ async function solveTurnstileIfPresent(page, stageName = "通用", maxAttempts =
                         // 截图 (Turnstile 状态)
                         // ...省略具体截图代码，保持原样逻辑即可...
 
+                        // 先读一次弹窗/页面文本：如果已经提示“还没到续期时间”，直接停止本轮，不再进入 20 次刷新重试。
+                        if (await stopRetryIfNotYetRenewable(page, modal)) {
+                            renewSuccess = true; // 这里表示本次任务已处理完，不代表实际续期成功
+                            break;
+                        }
+
                         console.log('   >> 点击 Renew 确认按钮...');
                         await confirmBtn.click();
+                        await page.waitForTimeout(1500);
+
+                        // 点击确认后再读一次全页面文本：KataBump 经常在此时返回“还没到续期时间”。
+                        if (await stopRetryIfNotYetRenewable(page, modal)) {
+                            renewSuccess = true; // 这里表示本次任务已处理完，不代表实际续期成功
+                            break;
+                        }
 
                         // 错误检查与结果判断
                         let hasCaptchaError = false;
@@ -406,15 +458,8 @@ async function solveTurnstileIfPresent(page, stageName = "通用", maxAttempts =
                                     hasCaptchaError = true;
                                     break;
                                 }
-                                const notTimeLoc = page.getByText("You can't renew your server yet");
-                                if (await notTimeLoc.isVisible()) {
-                                    console.log(`   >> ⏳ 暂无法续期 (还没到时间)。`);
-                                    renewSuccess = true; // 视为完成
-                                    // ...截图与TG发送逻辑...
-                                    try { 
-                                        const closeBtn = modal.getByLabel('Close'); 
-                                        if (await closeBtn.isVisible()) await closeBtn.click(); 
-                                    } catch(e){}
+                                if (await stopRetryIfNotYetRenewable(page, modal)) {
+                                    renewSuccess = true; // 这里表示本次任务已处理完，不代表实际续期成功
                                     break;
                                 }
                                 await page.waitForTimeout(200);
