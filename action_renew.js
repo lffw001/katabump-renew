@@ -9,8 +9,8 @@ const http = require('http');
 // --- 退出码（供外层 proxy_runner.js 使用） ---
 const EXIT_CODE = {
     SUCCESS: 0,
-    FATAL_ERROR: 1,
-    PROXY_RETRY: 2,       // Turnstile 3次尝试仍失败，应换代理重试
+    FATAL: 1,
+    PROXY_RETRY: 42,      // Turnstile 3次仍失败 → 外层换代理，不与其他退出码冲突
     NOT_READY: 3,         // 还没到续期窗口
     ALREADY_RENEWED: 4,   // Expiry 未变化，本轮已是最新
     LOGIN_FAILED: 5       // 账号或密码错误
@@ -1240,12 +1240,16 @@ async function ensureScreenshotsDir() {
 
     await page.addInitScript(INJECTED_SCRIPT);
 
+    let overallExitCode = EXIT_CODE.SUCCESS;
+    let anyUserRetriedProxy = false;
+    let shouldStopAllUsers = false;
+
     for (let i = 0; i < users.length; i++) {
         const user = users[i];
         console.log(`\n=== 正在处理用户 ${i + 1}/${users.length} ===`);
 
         let renewSuccess = false;
-        let runStatus = 'unknown'; // 'success' | 'not_ready' | 'captcha_required' | 'login_failed' | 'error'
+        let runStatus = 'unknown';
         let blockMessage = '';
 
         try {
@@ -1288,7 +1292,9 @@ async function ensureScreenshotsDir() {
                             ? `login_turnstile_click_target_missing_${user.username.replace(/[^a-z0-9]/gi, '_')}`
                             : `login_turnstile_token_missing_${user.username.replace(/[^a-z0-9]/gi, '_')}`;
                 await dumpDebugSnapshot(page, snapName);
-                continue;
+                overallExitCode = EXIT_CODE.PROXY_RETRY;
+                shouldStopAllUsers = true;
+                break;
             }
             console.log(`[登录阶段] state=${turnstileResult.state}，可以填写凭据并提交。`);
 
@@ -1315,7 +1321,9 @@ async function ensureScreenshotsDir() {
                         page,
                         `login_turnstile_token_lost_${user.username.replace(/[^a-z0-9]/gi, '_')}`
                     );
-                    continue;
+                    overallExitCode = EXIT_CODE.PROXY_RETRY;
+                    shouldStopAllUsers = true;
+                    break;
                 }
                 console.log(`[登录阶段] 提交前 token 仍有效，字段=${tokenStillValid.selector}，长度=${tokenStillValid.length}，提交 Login...`);
 
@@ -1345,7 +1353,9 @@ async function ensureScreenshotsDir() {
                         blockMessage = 'Incorrect password or no account';
                         const photoDir = await ensureScreenshotsDir();
                         await page.screenshot({ path: path.join(photoDir, `login_failed_${user.username.replace(/[^a-z0-9]/gi, '_')}.png`), fullPage: true });
-                        continue;
+                        overallExitCode = EXIT_CODE.LOGIN_FAILED;
+                        shouldStopAllUsers = true;
+                        break;
                     }
                 } catch (e) { }
 
@@ -1366,7 +1376,9 @@ async function ensureScreenshotsDir() {
                             const html2 = await page.content();
                             fs.writeFileSync(path.join(photoDir2, `login_captcha_required_${user.username.replace(/[^a-z0-9]/gi, '_')}.html`), html2, 'utf-8');
                         } catch (e) { }
-                        continue;
+                        overallExitCode = EXIT_CODE.PROXY_RETRY;
+                        shouldStopAllUsers = true;
+                        break;
                     }
                 }
 
@@ -1457,7 +1469,9 @@ async function ensureScreenshotsDir() {
                 blockMessage = 'Dashboard entry not found after login';
                 const photoDir = await ensureScreenshotsDir();
                 await page.screenshot({ path: path.join(photoDir, `login_failed_no_dashboard_${user.username.replace(/[^a-z0-9]/gi, '_')}.png`), fullPage: true });
-                continue;
+                overallExitCode = EXIT_CODE.LOGIN_FAILED;
+                shouldStopAllUsers = true;
+                break;
             }
 
             // 如果有 See 按钮，点击它；否则认为已在 dashboard 页面
@@ -1885,18 +1899,43 @@ async function ensureScreenshotsDir() {
             await sendTelegramMessage(`ℹ️ KataBump 可能已续期\n用户: ${user.username}\nExpiry 未变化，可能本轮已是最新。`);
         }
 
+        if (runStatus === 'captcha_required') anyUserRetriedProxy = true;
+        if (runStatus === 'error') { overallExitCode = EXIT_CODE.FATAL; shouldStopAllUsers = true; }
+        if (runStatus === 'login_failed') { overallExitCode = EXIT_CODE.LOGIN_FAILED; shouldStopAllUsers = true; }
+        if (runStatus === 'success' && overallExitCode === EXIT_CODE.SUCCESS) overallExitCode = EXIT_CODE.SUCCESS;
+        if (runStatus === 'not_ready' && overallExitCode === EXIT_CODE.SUCCESS) overallExitCode = EXIT_CODE.NOT_READY;
+        if (runStatus === 'already_renewed' && overallExitCode === EXIT_CODE.SUCCESS) overallExitCode = EXIT_CODE.ALREADY_RENEWED;
+
         console.log(`用户处理完成 | 状态: ${runStatus}`);
+
+        if (shouldStopAllUsers) {
+            console.log('[主流程] 检测到不可继续的状态，停止后续用户');
+            break;
+        }
     }
 
     console.log('\n全部账号处理完成。');
-    await browser.close();
 
-    // 映射 runStatus → 退出码（供外层 proxy_runner.js 判断）
-    if (runStatus === 'success') process.exit(EXIT_CODE.SUCCESS);
-    if (runStatus === 'not_ready') process.exit(EXIT_CODE.NOT_READY);
-    if (runStatus === 'already_renewed') process.exit(EXIT_CODE.ALREADY_RENEWED);
-    if (runStatus === 'login_failed') process.exit(EXIT_CODE.LOGIN_FAILED);
-    if (runStatus === 'captcha_required') process.exit(EXIT_CODE.PROXY_RETRY);
-    // 未知状态也按 PROXY_RETRY 处理（外层可能试另一个代理）
-    process.exit(EXIT_CODE.PROXY_RETRY);
+    try {
+        // 可靠关闭浏览器
+        const contexts = browser.contexts();
+        for (const ctx of contexts) {
+            for (const p of ctx.pages()) await p.close().catch(() => {});
+            await ctx.close().catch(() => {});
+        }
+        await browser.close().catch(() => {});
+    } catch (e) {
+        console.log('[cleanup] browser close 异常:', e.message);
+    }
+
+    // 优先取覆盖性错误
+    if (overallExitCode === EXIT_CODE.FATAL)
+        process.exit(EXIT_CODE.FATAL);
+    if (overallExitCode === EXIT_CODE.LOGIN_FAILED)
+        process.exit(EXIT_CODE.LOGIN_FAILED);
+    // 若有用户请求换代理，优先返回 PROXY_RETRY
+    if (anyUserRetriedProxy)
+        process.exit(EXIT_CODE.PROXY_RETRY);
+    // 其余情况
+    process.exit(overallExitCode);
 })();
