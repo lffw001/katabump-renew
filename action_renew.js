@@ -4,6 +4,9 @@ const axios = require('axios');
 const FormData = require('form-data');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
+const http = require('http');
+const { spawn } = require('child_process');
 const {
     buildBrowserLaunchOptions,
     classifyProxyResponse,
@@ -50,9 +53,15 @@ process.env.NO_PROXY = 'localhost,127.0.0.1';
 
 const HTTP_PROXY = process.env.HTTP_PROXY;
 const TARGET_LOGIN_URL = 'https://dashboard.katabump.com/auth/login';
+const CHROME_BOOT_TIMEOUT_MS = 20_000;
+const CDP_CONNECT_ATTEMPTS = 5;
+const CDP_CONNECT_DELAY_MS = 2_000;
 let PROXY_CONFIG = null;
 let PROXY_CONFIG_ERROR = null;
-let activeBrowser = null;
+let DEBUG_PORT = null;
+let activeBrowserConnection = null;
+let activeChromeChild = null;
+let activeChromeUserDataDir = null;
 let shutdownRequested = false;
 let shutdownPromise = null;
 
@@ -149,6 +158,160 @@ async function checkProxy() {
             : classifyProxyError(error);
         console.error(`[代理] 预检失败：分类=${result.category}，错误=${result.error || 'none'}`);
         return result;
+    }
+}
+
+function getAvailableDebugPort() {
+    return new Promise((resolve, reject) => {
+        const server = require('net').createServer();
+        server.once('error', reject);
+        server.listen(0, '127.0.0.1', () => {
+            const address = server.address();
+            const port = address && typeof address === 'object' ? address.port : null;
+            server.close((error) => error ? reject(error) : resolve(port));
+        });
+    });
+}
+
+function checkPort(port) {
+    return new Promise((resolve) => {
+        const request = http.get(`http://127.0.0.1:${port}/json/version`, (response) => {
+            response.resume();
+            resolve(Boolean(response.statusCode));
+        });
+        request.setTimeout(1000, () => {
+            request.destroy();
+            resolve(false);
+        });
+        request.on('error', () => resolve(false));
+    });
+}
+
+function waitForChromePort(port, timeoutMs = CHROME_BOOT_TIMEOUT_MS) {
+    const deadline = Date.now() + timeoutMs;
+    return (async () => {
+        while (Date.now() < deadline) {
+            if (await checkPort(port)) return true;
+            await new Promise(resolve => setTimeout(resolve, 500));
+        }
+        return false;
+    })();
+}
+
+async function launchChrome() {
+    DEBUG_PORT = await getAvailableDebugPort();
+    activeChromeUserDataDir = fs.mkdtempSync(path.join(os.tmpdir(), `katabump-chrome-${process.pid}-`));
+    console.log(`检查 Chrome 调试端口 ${DEBUG_PORT}...`);
+
+    const launchOptions = buildBrowserLaunchOptions(PROXY_CONFIG);
+    const args = [
+        ...launchOptions.args,
+        `--remote-debugging-port=${DEBUG_PORT}`,
+        `--user-data-dir=${activeChromeUserDataDir}`
+    ];
+    if (PROXY_CONFIG) {
+        args.push(`--proxy-server=${PROXY_CONFIG.server}`);
+        args.push('--proxy-bypass-list=<-loopback>');
+    }
+
+    console.log(`正在启动 Chrome (路径: ${CHROME_PATH})...`);
+    activeChromeChild = spawn(CHROME_PATH, args, {
+        detached: false,
+        stdio: 'ignore'
+    });
+
+    try {
+        await new Promise((resolve, reject) => {
+            activeChromeChild.once('error', reject);
+            if (activeChromeChild.exitCode !== null) {
+                reject(new Error(`Chrome exited with code ${activeChromeChild.exitCode}`));
+            } else {
+                resolve();
+            }
+        });
+    } catch (error) {
+        await closeActiveChrome();
+        throw new Error(`Chrome 启动失败: ${error.message}`);
+    }
+
+    console.log('正在等待 Chrome 初始化...');
+    if (!await waitForChromePort(DEBUG_PORT)) {
+        await closeActiveChrome();
+        throw new Error(`Chrome 调试端口 ${DEBUG_PORT} 未在 ${CHROME_BOOT_TIMEOUT_MS}ms 内就绪`);
+    }
+}
+
+async function connectToChrome() {
+    if (!DEBUG_PORT) throw new Error('Chrome 调试端口未初始化');
+    console.log('正在连接 Chrome...');
+    let lastError = null;
+    for (let attempt = 1; attempt <= CDP_CONNECT_ATTEMPTS; attempt++) {
+        try {
+            activeBrowserConnection = await chromium.connectOverCDP(`http://127.0.0.1:${DEBUG_PORT}`);
+            console.log('连接成功！');
+            return activeBrowserConnection;
+        } catch (error) {
+            lastError = error;
+            console.error(`连接尝试 ${attempt}/${CDP_CONNECT_ATTEMPTS} 失败`);
+            if (attempt < CDP_CONNECT_ATTEMPTS) {
+                await new Promise(resolve => setTimeout(resolve, CDP_CONNECT_DELAY_MS));
+            }
+        }
+    }
+    throw new Error(`CDP 连接失败: ${lastError ? lastError.message : 'unknown error'}`);
+}
+
+async function prepareCdpAccountPage(browser) {
+    const contexts = browser.contexts();
+    const context = contexts[0];
+    if (!context) throw new Error('CDP 浏览器没有可用的默认 BrowserContext');
+    await context.clearCookies();
+    for (const existingPage of context.pages()) {
+        await existingPage.close().catch(() => {});
+    }
+    const page = await context.newPage();
+    if (PROXY_CONFIG && PROXY_CONFIG.username && PROXY_CONFIG.password && typeof context.setHTTPCredentials === 'function') {
+        await context.setHTTPCredentials({
+            username: PROXY_CONFIG.username,
+            password: PROXY_CONFIG.password
+        });
+    }
+    page.setDefaultTimeout(60000);
+    await page.addInitScript(INJECTED_SCRIPT);
+    return { context, page };
+}
+
+async function closeActiveChrome() {
+    const chrome = activeChromeChild;
+    const userDataDir = activeChromeUserDataDir;
+    activeChromeChild = null;
+    activeChromeUserDataDir = null;
+
+    if (chrome && chrome.exitCode === null) {
+        try { chrome.kill('SIGTERM'); } catch (error) { }
+        await new Promise(resolve => {
+            let settled = false;
+            const finish = () => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                resolve();
+            };
+            const timer = setTimeout(finish, 3000);
+            chrome.once('exit', finish);
+            chrome.once('error', finish);
+        });
+        if (chrome.exitCode === null) {
+            try { chrome.kill('SIGKILL'); } catch (error) { }
+        }
+    }
+
+    if (userDataDir) {
+        try {
+            fs.rmSync(userDataDir, { recursive: true, force: true });
+        } catch (error) {
+            console.error('[cleanup] Chrome user-data-dir 清理失败:', error.message);
+        }
     }
 }
 
@@ -1245,13 +1408,14 @@ async function runMain() {
         }
     }
 
-    console.log(`正在启动 Chrome (路径: ${CHROME_PATH})...`);
-    activeBrowser = await chromium.launch({
-        executablePath: CHROME_PATH,
-        ...buildBrowserLaunchOptions(PROXY_CONFIG)
-    });
-    const browser = activeBrowser;
-    console.log('Chrome 启动成功。');
+    let browser;
+    try {
+        await launchChrome();
+        browser = await connectToChrome();
+    } catch (error) {
+        console.error('[主流程] Chrome/CDP 启动失败:', error.message);
+        return EXIT_CODE.FATAL;
+    }
     let context = null;
     let page = null;
 
@@ -1277,16 +1441,19 @@ async function runMain() {
                 runStatus = 'login_failed';
                 blockMessage = `Invalid account configuration: ${user.__invalidReason}`;
             } else {
-            // 每个账号使用独立的 BrowserContext，隔离 Cookie、Storage、IndexedDB、
-            // Service Worker、Cache Storage 以及其他 Context 级状态。
-            context = await browser.newContext();
-            page = await context.newPage();
-            page.setDefaultTimeout(60000);
-            await page.addInitScript(INJECTED_SCRIPT);
+            // CDP 模式使用历史成功链路的默认 Context；每个账号关闭 page、清 Cookie，避免会话串联。
+            const preparedPage = await prepareCdpAccountPage(browser);
+            context = preparedPage.context;
+            page = preparedPage.page;
 
             // 1. 访问登录页
             console.log('访问登录页面...');
             await page.goto(TARGET_LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+            await page.evaluate(() => {
+                try { localStorage.clear(); } catch (e) { }
+                try { sessionStorage.clear(); } catch (e) { }
+            }).catch(() => {});
+            await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 });
 
             // 登录页 Turnstile 严格状态机：
             // widget 健康 → 点击 → 等 token → token 有值才提交
@@ -1916,6 +2083,7 @@ async function runMain() {
                 context,
                 ensureDir: ensureScreenshotsDir,
                 screenshotName: `${accountLabel}.png`,
+                closeContext: false,
                 logger: console.error
             });
             finalScreenshotPath = cleanupResult.screenshotPath;
@@ -1977,8 +2145,8 @@ async function runMain() {
 }
 
 async function closeActiveBrowser() {
-    const browser = activeBrowser;
-    activeBrowser = null;
+    const browser = activeBrowserConnection;
+    activeBrowserConnection = null;
     if (!browser) return;
 
     let contexts = [];
@@ -2014,6 +2182,11 @@ async function closeActiveBrowser() {
     }
 }
 
+async function closeRuntimeResources() {
+    await closeActiveBrowser();
+    await closeActiveChrome();
+}
+
 function installSignalHandlers() {
     const handleShutdownSignal = (signal) => {
         if (shutdownRequested) return;
@@ -2025,7 +2198,7 @@ function installSignalHandlers() {
             process.exit(EXIT_CODE.FATAL);
         }, 8000);
 
-        shutdownPromise = closeActiveBrowser()
+        shutdownPromise = closeRuntimeResources()
             .catch((error) => {
                 console.error('[主流程] 信号清理失败:', error.message);
             })
@@ -2048,7 +2221,7 @@ function installSignalHandlers() {
         console.error('[主流程] 未处理异常:', error.message);
         finalExitCode = EXIT_CODE.FATAL;
     } finally {
-        await closeActiveBrowser();
+        await closeRuntimeResources();
     }
     process.exit(finalExitCode);
 })();
