@@ -78,20 +78,85 @@ function removeExpiredCooldowns(cooldowns) {
 }
 
 // ============================================================
-//  代理选择
+//  代理解析（唯一真相源）
 // ============================================================
-// 仅掩码 auth 部分，避免把整个代理 URL 当成单一掩码导致日志里仍出现明文
+function parseProxyLine(line) {
+    const trimmed = (line || '').trim();
+    if (!trimmed || trimmed.startsWith('#')) return { valid: false, reason: 'empty_or_comment' };
+
+    let ip = '';
+    let port = '';
+    let username = '';
+    let password = '';
+    let hostPort = '';
+
+    const atIdx = trimmed.lastIndexOf('@');
+    if (atIdx > 0) {
+        const auth = trimmed.substring(0, atIdx);
+        hostPort = trimmed.substring(atIdx + 1);
+        const credParts = auth.split(':');
+        username = credParts[0] || '';
+        password = credParts.slice(1).join(':') || '';
+    } else {
+        hostPort = trimmed;
+    }
+
+    const parts = hostPort.split(':');
+    if (parts.length < 2) return { raw: trimmed, valid: false, reason: 'missing_ip_or_port' };
+
+    ip = parts[0];
+    port = parts[1];
+
+    if (!ip) return { raw: trimmed, valid: false, reason: 'empty_ip' };
+    if (!port) return { raw: trimmed, valid: false, reason: 'empty_port' };
+
+    const portNum = Number(port);
+    if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535) {
+        return { raw: trimmed, valid: false, reason: `invalid_port:${port}` };
+    }
+
+    if (atIdx === -1 && parts.length >= 4) {
+        username = parts[2] || '';
+        password = parts.slice(3).join(':') || '';
+    }
+
+    return { raw: trimmed, valid: true, ip, port, username, password };
+}
+
+function buildHttpProxy(parsed) {
+    if (!parsed || !parsed.valid || !parsed.ip || !parsed.port) return null;
+    const encodedUser = parsed.username ? encodeURIComponent(parsed.username) : '';
+    const encodedPass = parsed.password ? encodeURIComponent(parsed.password) : '';
+    const auth = [encodedUser, encodedPass].filter(Boolean).join(':');
+    return auth
+        ? `http://${auth}@${parsed.ip}:${parsed.port}`
+        : `http://${parsed.ip}:${parsed.port}`;
+}
+
+function proxyKey(parsed) {
+    return `${parsed.ip}:${parsed.port}`;
+}
+
 function maskProxyUrl(proxyUrl) {
     try {
         const u = new URL(proxyUrl);
-        const auth = u.username || u.password
-            ? `${u.username || ''}:${u.password || ''}@`
-            : '';
-        return `${u.protocol}//${auth}***`;
+        if (u.username || u.password) {
+            return `${u.protocol}//***:***@${u.hostname}:${u.port}`;
+        }
+        return proxyUrl;
     } catch {
-        return proxyUrl.replace(/\/\/[^@]+@/, '//***@');
+        return '***';
     }
 }
+
+function safeProxyId(parsed) {
+    if (!parsed || !parsed.valid) return 'invalid';
+    return `${parsed.ip}:${parsed.port}`;
+}
+
+// ============================================================
+//  代理选择
+// ============================================================
 function loadProxies() {
     if (!fs.existsSync(CONFIG.PROXIES_FILE)) {
         console.log('[proxy-runner] proxies.txt 不存在，直接运行（无代理）');
@@ -103,14 +168,15 @@ function loadProxies() {
     const invalid = [];
     for (const line of lines) {
         const parsed = parseProxyLine(line);
-        if (parsed && parsed.ip && parsed.port) {
-            valid.push(line);
+        if (parsed.valid) {
+            valid.push(parsed);
         } else {
-            invalid.push(line);
+            invalid.push(parsed);
         }
     }
     if (invalid.length > 0) {
-        console.log(`[proxy-runner] 已过滤 ${invalid.length} 条无效代理格式: ${invalid.slice(0, 5).join(' | ')}${invalid.length > 5 ? ' ...' : ''}`);
+        const sample = invalid.slice(0, 5).map(p => '[invalid]' + p.raw.replace(/\/\/.*@/, '//***@')).join(' | ');
+        console.log(`[proxy-runner] 已过滤 ${invalid.length} 条无效代理格式: ${sample}${invalid.length > 5 ? ' ...' : ''}`);
     }
     console.log(`[proxy-runner] proxies.txt 共 ${valid.length} 条有效代理`);
     return valid;
@@ -118,65 +184,22 @@ function loadProxies() {
 
 function selectRandomProxy(proxies, cooldowns) {
     const now = Math.floor(Date.now() / 1000);
-    const available = proxies.filter(line => {
-        const ip = line.split(':')[0];
-        const port = line.split(':')[1];
-        const key = `${ip}:${port}`;
-        return !cooldowns[key] || cooldowns[key].until <= now;
-    });
+    const available = [];
+    for (const parsed of proxies) {
+        const key = proxyKey(parsed);
+        if (!cooldowns[key] || cooldowns[key].until <= now) {
+            available.push(parsed);
+        }
+    }
 
     if (available.length === 0) {
         console.log('[proxy-runner] 无可选代理（全部冷却中），本轮停止，不清空冷却名单');
         return null;
     }
 
-    const line = available[crypto.randomInt(available.length)];
-    const ip = line.split(':')[0];
-    const port = line.split(':')[1];
-    console.log(`[proxy-runner] 选择代理: ${ip}:${port}`);
-    return { line, source: 'selected' };
-}
-
-function parseProxyLine(line) {
-    const trimmed = (line || '').trim();
-    const authIdx = trimmed.lastIndexOf('@');
-    let hostPort = trimmed;
-    let userPass = '';
-
-    if (authIdx > 0) {
-        hostPort = trimmed.substring(authIdx + 1);
-        userPass = trimmed.substring(0, authIdx);
-    }
-
-    const parts = hostPort.split(':');
-    if (parts.length < 2) return null;
-
-    const ip = parts[0];
-    const port = parts[1];
-    let username = '';
-    let password = '';
-
-    if (userPass) {
-        const credParts = userPass.split(':');
-        username = credParts[0] || '';
-        password = credParts.slice(1).join(':') || '';
-    }
-
-    return { ip, port, username, password };
-}
-
-function buildHttpProxy(line) {
-    if (!line) return null;
-    const parsed = parseProxyLine(line);
-    if (!parsed || !parsed.ip || !parsed.port) return null;
-
-    const encodedUser = parsed.username ? encodeURIComponent(parsed.username) : '';
-    const encodedPass = parsed.password ? encodeURIComponent(parsed.password) : '';
-    const auth = [encodedUser, encodedPass].filter(Boolean).join(':');
-
-    return auth
-        ? `http://${auth}@${parsed.ip}:${parsed.port}`
-        : `http://${parsed.ip}:${parsed.port}`;
+    const parsed = available[crypto.randomInt(available.length)];
+    console.log(`[proxy-runner] 选择代理: ${safeProxyId(parsed)}`);
+    return { parsed, source: 'selected' };
 }
 
 // ============================================================
@@ -255,27 +278,20 @@ function ensureChromeKilled() {
 // ============================================================
 //  运行子进程
 // ============================================================
-function runActionRenew(proxyLine) {
+function runActionRenew(parsed) {
     return new Promise((resolve) => {
         const env = { ...process.env };
 
-        if (proxyLine) {
-            const proxyUrl = buildHttpProxy(proxyLine);
-            if (!proxyUrl) {
-                console.error(`[proxy-runner] 当前代理格式无效，不静默直连: ${proxyLine}`);
-                process.exit(EXIT_CODE.FATAL);
-            }
-            env.HTTP_PROXY = proxyUrl;
-            env.HTTPS_PROXY = proxyUrl;
-            const ip = proxyLine.split(':')[0];
-            const port = proxyLine.split(':')[1];
-            console.log(`[proxy-runner] 设置 HTTP_PROXY=${ip}:${port}`);
-            console.log(`[proxy-runner] 代理地址: ${maskProxyUrl(proxyUrl)}`);
-            console.log(`::add-mask::${proxyUrl}`);
-        } else {
-            delete env.HTTP_PROXY;
-            delete env.HTTPS_PROXY;
+        const proxyUrl = buildHttpProxy(parsed);
+        if (!proxyUrl) {
+            console.error(`[proxy-runner] 当前代理格式无效，不静默直连: ${parsed.raw.replace(/\/\/.*@/, '//***@')}`);
+            process.exit(EXIT_CODE.FATAL);
         }
+        env.HTTP_PROXY = proxyUrl;
+        env.HTTPS_PROXY = proxyUrl;
+        console.log(`[proxy-runner] 设置 HTTP_PROXY=${safeProxyId(parsed)}`);
+        console.log(`[proxy-runner] 代理地址: ${maskProxyUrl(proxyUrl)}`);
+        console.log(`::add-mask::${proxyUrl}`);
 
         const scriptPath = path.join(process.cwd(), 'action_renew.js');
         console.log(`[proxy-runner] 启动 action_renew.js...`);
@@ -311,7 +327,7 @@ function runActionRenew(proxyLine) {
 // ============================================================
 //  主流程
 // ============================================================
-(async () => {
+async function main() {
     console.log(`[proxy-runner] 启动代理轮换控制器`);
     console.log(`[proxy-runner] 最多尝试 ${CONFIG.MAX_PROXY_SWITCHES} 个代理，冷却 ${CONFIG.COOLDOWN_HOURS}h`);
     console.log(`[proxy-runner] 退出码映射: SUCCESS=0 FATAL=1 PROXY_RETRY=42 NOT_READY=3 ALREADY_RENEWED=4 LOGIN_FAILED=5 NO_PROXY_AVAILABLE=6 RENEW_CAPTCHA_FAILED=43`);
@@ -324,15 +340,12 @@ function runActionRenew(proxyLine) {
         console.log(`\n[proxy-runner] ===== 代理尝试 ${attempt}/${CONFIG.MAX_PROXY_SWITCHES} =====`);
 
         // 1) 选代理
-        let proxyLine = null;
         let selection = null;
 
         if (proxies.length > 0) {
             selection = selectRandomProxy(proxies, cooldowns);
-            if (selection) {
-                proxyLine = selection.line;
-            } else {
-                console.log('[proxy-runner] 无可选代理（全部冷却中），等待冷却过期');
+            if (!selection) {
+                console.log('[proxy-runner] 无可选代理（全部冷却中），本轮停止，不清空冷却名单');
                 process.exit(EXIT_CODE.NO_PROXY_AVAILABLE);
             }
         } else {
@@ -344,7 +357,7 @@ function runActionRenew(proxyLine) {
         ensureChromeKilled();
 
         // 3) 跑业务脚本
-        const result = await runActionRenew(proxyLine);
+        const result = await runActionRenew(selection ? selection.parsed : null);
         const code = result.code;
 
         // 4) 子进程结束后再杀一次 Chrome（action_renew.js 可能在 finally 中关，但双重保险）
@@ -362,14 +375,12 @@ function runActionRenew(proxyLine) {
             process.exit(normalizedCode);
         }
 
-        if (code === EXIT_CODE.PROXY_RETRY && proxyLine && selection) {
-            const ip = proxyLine.split(':')[0];
-            const port = proxyLine.split(':')[1];
-            const key = `${ip}:${port}`;
-            // 立即冷却
+        if (code === EXIT_CODE.PROXY_RETRY && selection) {
+            const parsed = selection.parsed;
+            const key = proxyKey(parsed);
             console.log(`[proxy-runner] action_renew.js 退出码: 42`);
-            console.log(`[proxy-runner] 代理 ${ip}:${port} 加入冷却，时长 4h`);
-            addCooldown(cooldowns, key, 'turnstile_failed_3_attempts');
+            console.log(`[proxy-runner] 代理 ${safeProxyId(parsed)} 加入冷却，时长 4h`);
+            addCooldown(cooldowns, key, 'proxy_retry_from_action_renew');
             cooldowns = loadCooldowns();
             console.log(`[proxy-runner] 选择下一个代理`);
             continue;
@@ -387,4 +398,21 @@ function runActionRenew(proxyLine) {
 
     console.log(`[proxy-runner] 已尝试 ${CONFIG.MAX_PROXY_SWITCHES} 个代理，均未成功`);
     process.exit(EXIT_CODE.FATAL);
-})();
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(__filename)) {
+    main().catch((e) => {
+        console.error(e);
+        process.exit(EXIT_CODE.FATAL);
+    });
+}
+
+module.exports = {
+    parseProxyLine,
+    buildHttpProxy,
+    maskProxyUrl,
+    loadProxies,
+    selectRandomProxy,
+    proxyKey,
+    safeProxyId
+};
