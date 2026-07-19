@@ -1943,9 +1943,6 @@ function mergeExitCode(current, newCode) {
 
         if (stopCurrentUser) {
             console.log('[主流程] 当前账号结束，继续下一个账号');
-        } else if (shouldStopAllUsers) {
-            console.log('[主流程] 检测到全局终止状态，停止后续用户');
-            break;
         }
 
         // 用户处理完成，发送最终状态通知
@@ -1960,7 +1957,7 @@ function mergeExitCode(current, newCode) {
         if (runStatus === 'unknown' || runStatus === 'unknown_blocked') {
             console.error('   >> ⚠️ Renew 循环未得到明确结果 (runStatus=' + runStatus + ')，标记 FATAL');
             runStatus = 'error';
-            blockMessage = 'Renew loop exhausted without clear result';
+            if (!blockMessage) blockMessage = 'Renew loop exhausted without clear result';
         }
 
         if (runStatus === 'success') {
