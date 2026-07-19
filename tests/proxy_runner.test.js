@@ -1,6 +1,7 @@
 const assert = require('assert');
 const { execSync } = require('child_process');
 const path = require('path');
+const fs = require('fs');
 
 function runCheck() {
     execSync('node --check ../proxy_runner.js', { cwd: __dirname, stdio: 'pipe' });
@@ -26,33 +27,54 @@ function tests() {
     const samples = [
         {
             line: '1.2.3.4:8080:user:password',
-            expect: { raw: '1.2.3.4:8080:user:password', ip: '1.2.3.4', port: '8080', username: 'user', password: 'password', valid: true }
+            expect: { ip: '1.2.3.4', port: '8080', username: 'user', password: 'password', valid: true }
         },
         {
             line: 'user:pass@1.2.3.4:8080',
-            expect: { raw: 'user:pass@1.2.3.4:8080', ip: '1.2.3.4', port: '8080', username: 'user', password: 'pass', valid: true }
+            expect: { ip: '1.2.3.4', port: '8080', username: 'user', password: 'pass', valid: true }
         },
         {
             line: '1.2.3.4:8080',
-            expect: { raw: '1.2.3.4:8080', ip: '1.2.3.4', port: '8080', username: '', password: '', valid: true }
+            expect: { ip: '1.2.3.4', port: '8080', username: '', password: '', valid: true }
         },
         {
             line: '1.2.3.4:0',
-            expect: { raw: '1.2.3.4:0', valid: false, reason: 'invalid_port:0' }
+            expect: { valid: false, reason: 'invalid_port:0' }
         },
         {
             line: '1.2.3.4:65536',
-            expect: { raw: '1.2.3.4:65536', valid: false, reason: 'invalid_port:65536' }
+            expect: { valid: false, reason: 'invalid_port:65536' }
         },
         {
             line: 'abc:def',
-            expect: { raw: 'abc:def', valid: false, reason: 'invalid_port:def' }
+            expect: { valid: false, reason: 'invalid_port:def' }
+        },
+        {
+            line: '1.2.3.4:8080:user',
+            expect: { valid: false, reason: 'invalid_field_count:3' }
+        },
+        {
+            line: '1.2.3.4:8080:user:pa@ss',
+            expect: { ip: '1.2.3.4', port: '8080', username: 'user', password: 'pa@ss', valid: true }
+        },
+        {
+            line: '',
+            expect: { valid: false, reason: 'empty_or_comment' }
+        },
+        {
+            line: '# comment',
+            expect: { valid: false, reason: 'empty_or_comment' }
         }
     ];
 
     for (const sample of samples) {
         const parsed = mod.parseProxyLine(sample.line);
-        assert.deepStrictEqual(parsed, sample.expect, `parse failed: ${sample.line}`);
+        assert.strictEqual(parsed.valid, sample.expect.valid, `valid mismatch: ${sample.line}`);
+        assert.strictEqual(parsed.reason, sample.expect.reason, `reason mismatch: ${sample.line}`);
+        assert.strictEqual(parsed.ip, sample.expect.ip, `ip mismatch: ${sample.line}`);
+        assert.strictEqual(parsed.port, sample.expect.port, `port mismatch: ${sample.line}`);
+        assert.strictEqual(parsed.username, sample.expect.username, `username mismatch: ${sample.line}`);
+        assert.strictEqual(parsed.password, sample.expect.password, `password mismatch: ${sample.line}`);
         if (parsed.valid) {
             const built = mod.buildHttpProxy(parsed);
             assert.strictEqual(built, `http://${parsed.username ? `${encodeURIComponent(parsed.username)}:${encodeURIComponent(parsed.password)}@` : ''}${parsed.ip}:${parsed.port}`);
@@ -67,7 +89,55 @@ function tests() {
 
     const selected = mod.selectRandomProxy([mod.parseProxyLine('1.2.3.4:8080:user:pass')], {});
     assert.ok(selected, 'selectRandomProxy should return parsed object');
-    assert.ok(selected.parsed && selected.parsed.username === 'user', 'selected parsed should preserve username');
+    assert.strictEqual(selected.username, 'user', 'selected parsed should preserve username');
+
+    // loadProxies: no file → configured=false
+    {
+        const origExistsSync = fs.existsSync;
+        fs.existsSync = () => false;
+        try {
+            const noFile = mod.loadProxies();
+            assert.strictEqual(noFile.configured, false);
+            assert.deepStrictEqual(noFile.valid, []);
+            assert.strictEqual(noFile.invalidCount, 0);
+        } finally {
+            fs.existsSync = origExistsSync;
+        }
+    }
+
+    // loadProxies: file with all invalid → configured=true, valid=[]
+    {
+        const origExistsSync = fs.existsSync;
+        const origReadFileSync = fs.readFileSync;
+        fs.existsSync = () => true;
+        fs.readFileSync = () => '1.2.3.4:99999:user:pass\nbadline\n';
+        try {
+            const allInvalid = mod.loadProxies();
+            assert.strictEqual(allInvalid.configured, true);
+            assert.deepStrictEqual(allInvalid.valid, []);
+            assert.strictEqual(allInvalid.invalidCount, 2);
+        } finally {
+            fs.existsSync = origExistsSync;
+            fs.readFileSync = origReadFileSync;
+        }
+    }
+
+    // loadProxies: file with mix → configured=true, valid has good lines
+    {
+        const origExistsSync = fs.existsSync;
+        const origReadFileSync = fs.readFileSync;
+        fs.existsSync = () => true;
+        fs.readFileSync = () => '1.2.3.4:8080:user:pass\nbadline\n5.6.7.8:3128:u2:p2\n';
+        try {
+            const mixed = mod.loadProxies();
+            assert.strictEqual(mixed.configured, true);
+            assert.strictEqual(mixed.valid.length, 2);
+            assert.strictEqual(mixed.invalidCount, 1);
+        } finally {
+            fs.existsSync = origExistsSync;
+            fs.readFileSync = origReadFileSync;
+        }
+    }
 
     console.log('[proxy-runner tests] all tests passed');
 }

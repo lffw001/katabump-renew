@@ -80,47 +80,61 @@ function removeExpiredCooldowns(cooldowns) {
 // ============================================================
 //  代理解析（唯一真相源）
 // ============================================================
-function parseProxyLine(line) {
+function parseProxyLine(line, lineNumber) {
     const trimmed = (line || '').trim();
-    if (!trimmed || trimmed.startsWith('#')) return { valid: false, reason: 'empty_or_comment' };
+    if (!trimmed || trimmed.startsWith('#')) return { valid: false, reason: 'empty_or_comment', lineNumber };
 
-    let ip = '';
-    let port = '';
-    let username = '';
-    let password = '';
-    let hostPort = '';
-
+    // Try USER:PASS@HOST:PORT format first (only when @ separates exactly 2 cred fields from 1 host field)
     const atIdx = trimmed.lastIndexOf('@');
     if (atIdx > 0) {
-        const auth = trimmed.substring(0, atIdx);
-        hostPort = trimmed.substring(atIdx + 1);
-        const credParts = auth.split(':');
-        username = credParts[0] || '';
-        password = credParts.slice(1).join(':') || '';
-    } else {
-        hostPort = trimmed;
+        const before = trimmed.substring(0, atIdx);
+        const after = trimmed.substring(atIdx + 1);
+        const beforeColons = before.split(':');
+        const afterColons = after.split(':');
+        if (beforeColons.length === 2 && afterColons.length >= 2) {
+            const host = afterColons[0];
+            const port = afterColons[1];
+            if (host && port) {
+                const portNum = Number(port);
+                if (Number.isInteger(portNum) && portNum >= 1 && portNum <= 65535) {
+                    return { valid: true, ip: host, port, username: beforeColons[0], password: beforeColons[1], lineNumber };
+                }
+                return { valid: false, reason: `invalid_port:${port}`, lineNumber };
+            }
+            if (!host) return { valid: false, reason: 'empty_host', lineNumber };
+            return { valid: false, reason: 'empty_port', lineNumber };
+        }
+        // @ present but not matching USER:PASS@HOST:PORT — fall through to colon-count format below
     }
 
-    const parts = hostPort.split(':');
-    if (parts.length < 2) return { raw: trimmed, valid: false, reason: 'missing_ip_or_port' };
-
-    ip = parts[0];
-    port = parts[1];
-
-    if (!ip) return { raw: trimmed, valid: false, reason: 'empty_ip' };
-    if (!port) return { raw: trimmed, valid: false, reason: 'empty_port' };
-
-    const portNum = Number(port);
-    if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535) {
-        return { raw: trimmed, valid: false, reason: `invalid_port:${port}` };
+    // HOST:PORT or HOST:PORT:USER:PASS — determined purely by field count
+    const parts = trimmed.split(':');
+    if (parts.length === 2) {
+        const ip = parts[0];
+        const port = parts[1];
+        if (!ip) return { valid: false, reason: 'empty_ip', lineNumber };
+        if (!port) return { valid: false, reason: 'empty_port', lineNumber };
+        const portNum = Number(port);
+        if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535) {
+            return { valid: false, reason: `invalid_port:${port}`, lineNumber };
+        }
+        return { valid: true, ip, port, username: '', password: '', lineNumber };
     }
 
-    if (atIdx === -1 && parts.length >= 4) {
-        username = parts[2] || '';
-        password = parts.slice(3).join(':') || '';
+    if (parts.length >= 4) {
+        const ip = parts[0];
+        const port = parts[1];
+        if (!ip) return { valid: false, reason: 'empty_ip', lineNumber };
+        if (!port) return { valid: false, reason: 'empty_port', lineNumber };
+        const portNum = Number(port);
+        if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535) {
+            return { valid: false, reason: `invalid_port:${port}`, lineNumber };
+        }
+        return { valid: true, ip, port, username: parts[2] || '', password: parts.slice(3).join(':'), lineNumber };
     }
 
-    return { raw: trimmed, valid: true, ip, port, username, password };
+    // 3 fields or any other count → ambiguous / malformed
+    return { valid: false, reason: `invalid_field_count:${parts.length}`, lineNumber };
 }
 
 function buildHttpProxy(parsed) {
@@ -160,26 +174,25 @@ function safeProxyId(parsed) {
 function loadProxies() {
     if (!fs.existsSync(CONFIG.PROXIES_FILE)) {
         console.log('[proxy-runner] proxies.txt 不存在，直接运行（无代理）');
-        return [];
+        return { configured: false, valid: [], invalidCount: 0 };
     }
     const raw = fs.readFileSync(CONFIG.PROXIES_FILE, 'utf-8');
     const lines = raw.split('\n').map(l => l.trim()).filter(l => l && !l.startsWith('#'));
     const valid = [];
     const invalid = [];
-    for (const line of lines) {
-        const parsed = parseProxyLine(line);
+    for (let i = 0; i < lines.length; i++) {
+        const parsed = parseProxyLine(lines[i], i + 1);
         if (parsed.valid) {
             valid.push(parsed);
         } else {
             invalid.push(parsed);
         }
     }
-    if (invalid.length > 0) {
-        const sample = invalid.slice(0, 5).map(p => '[invalid]' + p.raw.replace(/\/\/.*@/, '//***@')).join(' | ');
-        console.log(`[proxy-runner] 已过滤 ${invalid.length} 条无效代理格式: ${sample}${invalid.length > 5 ? ' ...' : ''}`);
+    for (const p of invalid) {
+        console.log(`[proxy-runner] 第 ${p.lineNumber} 行无效：${p.reason}`);
     }
     console.log(`[proxy-runner] proxies.txt 共 ${valid.length} 条有效代理`);
-    return valid;
+    return { configured: true, valid, invalidCount: invalid.length };
 }
 
 function selectRandomProxy(proxies, cooldowns) {
@@ -199,7 +212,7 @@ function selectRandomProxy(proxies, cooldowns) {
 
     const parsed = available[crypto.randomInt(available.length)];
     console.log(`[proxy-runner] 选择代理: ${safeProxyId(parsed)}`);
-    return { parsed, source: 'selected' };
+    return parsed;
 }
 
 // ============================================================
@@ -282,16 +295,25 @@ function runActionRenew(parsed) {
     return new Promise((resolve) => {
         const env = { ...process.env };
 
-        const proxyUrl = buildHttpProxy(parsed);
-        if (!proxyUrl) {
-            console.error(`[proxy-runner] 当前代理格式无效，不静默直连: ${parsed.raw.replace(/\/\/.*@/, '//***@')}`);
-            process.exit(EXIT_CODE.FATAL);
+        if (parsed === null) {
+            // 无代理直连模式：显式清除代理环境变量
+            delete env.HTTP_PROXY;
+            delete env.HTTPS_PROXY;
+            delete env.http_proxy;
+            delete env.https_proxy;
+            console.log('[proxy-runner] 无代理模式，已清除 HTTP_PROXY / HTTPS_PROXY');
+        } else {
+            const proxyUrl = buildHttpProxy(parsed);
+            if (!proxyUrl) {
+                console.error(`[proxy-runner] 当前代理格式无效，不静默直连`);
+                process.exit(EXIT_CODE.FATAL);
+            }
+            env.HTTP_PROXY = proxyUrl;
+            env.HTTPS_PROXY = proxyUrl;
+            console.log(`[proxy-runner] 设置 HTTP_PROXY=${safeProxyId(parsed)}`);
+            console.log(`[proxy-runner] 代理地址: ${maskProxyUrl(proxyUrl)}`);
+            console.log(`::add-mask::${proxyUrl}`);
         }
-        env.HTTP_PROXY = proxyUrl;
-        env.HTTPS_PROXY = proxyUrl;
-        console.log(`[proxy-runner] 设置 HTTP_PROXY=${safeProxyId(parsed)}`);
-        console.log(`[proxy-runner] 代理地址: ${maskProxyUrl(proxyUrl)}`);
-        console.log(`::add-mask::${proxyUrl}`);
 
         const scriptPath = path.join(process.cwd(), 'action_renew.js');
         console.log(`[proxy-runner] 启动 action_renew.js...`);
@@ -332,7 +354,8 @@ async function main() {
     console.log(`[proxy-runner] 最多尝试 ${CONFIG.MAX_PROXY_SWITCHES} 个代理，冷却 ${CONFIG.COOLDOWN_HOURS}h`);
     console.log(`[proxy-runner] 退出码映射: SUCCESS=0 FATAL=1 PROXY_RETRY=42 NOT_READY=3 ALREADY_RENEWED=4 LOGIN_FAILED=5 NO_PROXY_AVAILABLE=6 RENEW_CAPTCHA_FAILED=43`);
 
-    const proxies = loadProxies();
+    const proxyResult = loadProxies();
+    const proxies = proxyResult.valid;
     let cooldowns = loadCooldowns();
     removeExpiredCooldowns(cooldowns);
 
@@ -348,8 +371,11 @@ async function main() {
                 console.log('[proxy-runner] 无可选代理（全部冷却中），本轮停止，不清空冷却名单');
                 process.exit(EXIT_CODE.NO_PROXY_AVAILABLE);
             }
+        } else if (proxyResult.configured) {
+            console.log('[proxy-runner] proxies.txt 存在但无有效代理，禁止静默直连');
+            process.exit(EXIT_CODE.NO_PROXY_AVAILABLE);
         } else {
-            console.log('[proxy-runner] 无代理列表，直接运行');
+            console.log('[proxy-runner] 未配置 proxies.txt，无代理直连');
         }
 
         // 2) 彻底杀死旧 Chrome，清理数据
@@ -357,7 +383,7 @@ async function main() {
         ensureChromeKilled();
 
         // 3) 跑业务脚本
-        const result = await runActionRenew(selection ? selection.parsed : null);
+        const result = await runActionRenew(selection || null);
         const code = result.code;
 
         // 4) 子进程结束后再杀一次 Chrome（action_renew.js 可能在 finally 中关，但双重保险）
@@ -376,7 +402,7 @@ async function main() {
         }
 
         if (code === EXIT_CODE.PROXY_RETRY && selection) {
-            const parsed = selection.parsed;
+            const parsed = selection;
             const key = proxyKey(parsed);
             console.log(`[proxy-runner] action_renew.js 退出码: 42`);
             console.log(`[proxy-runner] 代理 ${safeProxyId(parsed)} 加入冷却，时长 4h`);
