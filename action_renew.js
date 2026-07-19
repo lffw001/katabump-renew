@@ -59,8 +59,11 @@ let PROXY_CONFIG = null;
 if (HTTP_PROXY) {
     try {
         const proxyUrl = new URL(HTTP_PROXY);
+        const proxyPort = proxyUrl.port || (proxyUrl.protocol === 'http:' ? '80' : '');
         PROXY_CONFIG = {
-            server: `${proxyUrl.protocol}//${proxyUrl.hostname}:${proxyUrl.port}`,
+            server: `${proxyUrl.protocol}//${proxyUrl.hostname}:${proxyPort}`,
+            host: proxyUrl.hostname,
+            port: proxyPort,
             username: proxyUrl.username ? decodeURIComponent(proxyUrl.username) : undefined,
             password: proxyUrl.password ? decodeURIComponent(proxyUrl.password) : undefined
         };
@@ -125,8 +128,8 @@ async function checkProxy() {
         const axiosConfig = {
             proxy: {
                 protocol: 'http',
-                host: new URL(PROXY_CONFIG.server).hostname,
-                port: new URL(PROXY_CONFIG.server).port,
+                host: PROXY_CONFIG.host,
+                port: Number(PROXY_CONFIG.port),
             },
             timeout: 10000
         };
@@ -1271,20 +1274,9 @@ function mergeExitCode(current, newCode) {
     }
     if (!browser) process.exit(1);
 
-    const context = browser.contexts()[0];
-    let page = context.pages().length > 0 ? context.pages()[0] : await context.newPage();
-    page.setDefaultTimeout(60000);
-
-    if (PROXY_CONFIG && PROXY_CONFIG.username) {
-        await context.setHTTPCredentials({
-            username: PROXY_CONFIG.username,
-            password: PROXY_CONFIG.password
-        });
-    } else {
-        await context.setHTTPCredentials(null);
-    }
-
-    await page.addInitScript(INJECTED_SCRIPT);
+    const defaultContext = browser.contexts()[0];
+    let context = null;
+    let page = null;
 
     let overallExitCode = EXIT_CODE.SUCCESS;
     let loginCaptchaFailed = false;
@@ -1301,15 +1293,20 @@ function mergeExitCode(current, newCode) {
         let blockMessage = '';
 
         try {
-            // 每个账号独立会话，清除上一账号的 Cookie 和存储
-            try { await context.clearCookies(); } catch(e) {}
-            try { await page.evaluate(() => { try { localStorage.clear(); } catch(e){} try { sessionStorage.clear(); } catch(e){} }).catch(() => {}); } catch(e) {}
-
-            const oldPage = page;
+            // 每个账号使用独立的 BrowserContext，隔离 Cookie、Storage、IndexedDB、
+            // Service Worker、Cache Storage 以及其他 Context 级状态。
+            context = await browser.newContext();
             page = await context.newPage();
+            page.setDefaultTimeout(60000);
+            if (PROXY_CONFIG && PROXY_CONFIG.username) {
+                await context.setHTTPCredentials({
+                    username: PROXY_CONFIG.username,
+                    password: PROXY_CONFIG.password
+                });
+            } else {
+                await context.setHTTPCredentials(null);
+            }
             await page.addInitScript(INJECTED_SCRIPT);
-            if (oldPage !== page) try { await oldPage.close(); } catch(e) {}
-
 
             // 1. 访问登录页
             console.log('访问登录页面...');
@@ -1952,6 +1949,16 @@ function mergeExitCode(current, newCode) {
             await page.screenshot({ path: path.join(photoDir, `${safeUsername}.png`), fullPage: true });
         } catch (e) { }
 
+        try {
+            if (page) await page.close();
+            if (context) await context.close();
+        } catch (e) {
+            console.log('[cleanup] 账号 BrowserContext 关闭异常:', e.message);
+        } finally {
+            page = null;
+            context = null;
+        }
+
         // Telegram 通知
         // Renew 循环出口守卫：unknown / unknown_blocked → FATAL
         if (runStatus === 'unknown' || runStatus === 'unknown_blocked') {
@@ -2004,7 +2011,7 @@ function mergeExitCode(current, newCode) {
         const contexts = browser.contexts();
         for (const ctx of contexts) {
             for (const p of ctx.pages()) await p.close().catch(() => {});
-            await ctx.close().catch(() => {});
+            if (ctx !== defaultContext) await ctx.close().catch(() => {});
         }
         await browser.close().catch(() => {});
     } catch (e) {

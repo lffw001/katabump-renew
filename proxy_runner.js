@@ -85,7 +85,11 @@ function parseProxyLine(line, lineNumber) {
     if (!trimmed || trimmed.startsWith('#')) return { valid: false, reason: 'empty_or_comment', lineNumber };
 
     const isValidPort = (s) => /^[0-9]+$/.test(s) && s.length > 0 && s.length <= 5 && Number(s) >= 1 && Number(s) <= 65535;
-    const isValidHost = (s) => s && !s.includes(' ') && !s.includes('/') && !s.includes('?') && !s.includes('#');
+    const isValidHost = (s) => (
+        typeof s === 'string' &&
+        s.length > 0 &&
+        !/[\s/\\?#@\u0000-\u001f\u007f]/.test(s)
+    );
 
     // Format 1: http://USER:PASSWORD@HOST:PORT
     if (trimmed.startsWith('http://')) {
@@ -166,6 +170,7 @@ function parseProxyLine(line, lineNumber) {
 function buildHttpProxy(parsed) {
     if (!parsed || !parsed.valid || !parsed.ip || !parsed.port) return null;
     if ((parsed.username && !parsed.password) || (!parsed.username && parsed.password)) return null;
+    if (/[\s/\\?#@\u0000-\u001f\u007f]/.test(parsed.ip)) return null;
     const encodedUser = parsed.username ? encodeURIComponent(parsed.username) : '';
     const encodedPass = parsed.password ? encodeURIComponent(parsed.password) : '';
     const auth = [encodedUser, encodedPass].filter(Boolean).join(':');
@@ -174,7 +179,25 @@ function buildHttpProxy(parsed) {
         : `http://${parsed.ip}:${parsed.port}`;
     try {
         const u = new URL(urlStr);
-        if (!u.hostname || u.hostname.includes(' ') || u.pathname !== '/' && u.pathname !== '') {
+        let decodedUser = '';
+        let decodedPass = '';
+        try {
+            decodedUser = u.username ? decodeURIComponent(u.username) : '';
+            decodedPass = u.password ? decodeURIComponent(u.password) : '';
+        } catch {
+            return null;
+        }
+        const effectivePort = u.port || (u.protocol === 'http:' ? '80' : '');
+        if (
+            u.protocol !== 'http:' ||
+            u.hostname !== parsed.ip ||
+            effectivePort !== String(parsed.port) ||
+            Boolean(u.username) !== Boolean(parsed.username) ||
+            Boolean(u.password) !== Boolean(parsed.password) ||
+            decodedUser !== (parsed.username || '') ||
+            decodedPass !== (parsed.password || '') ||
+            u.pathname !== '/' && u.pathname !== ''
+        ) {
             return null;
         }
     } catch {
@@ -210,12 +233,19 @@ function buildChildEnv(parsed, baseEnv) {
 function maskProxyUrl(proxyUrl) {
     try {
         const u = new URL(proxyUrl);
+        const port = u.port || (u.protocol === 'http:' ? '80' : '');
         if (u.username || u.password) {
-            return `${u.protocol}//***:***@${u.hostname}:${u.port}`;
+            return `${u.protocol}//***:***@${u.hostname}:${port}`;
         }
         return proxyUrl;
     } catch {
         return '***';
+    }
+}
+
+function emitGithubMask(proxyUrl, env = process.env, logger = console.log) {
+    if (env.GITHUB_ACTIONS === 'true') {
+        logger(`::add-mask::${proxyUrl}`);
     }
 }
 
@@ -369,7 +399,7 @@ function runActionRenew(parsed) {
             console.log(`[proxy-runner] 设置 HTTP_PROXY=${safeProxyId(parsed)}`);
             const proxyUrl = buildHttpProxy(parsed);
             console.log(`[proxy-runner] 代理地址: ${maskProxyUrl(proxyUrl)}`);
-            console.log(`::add-mask::${proxyUrl}`);
+            emitGithubMask(proxyUrl);
         }
 
         const scriptPath = path.join(process.cwd(), 'action_renew.js');
@@ -495,6 +525,7 @@ module.exports = {
     buildHttpProxy,
     buildChildEnv,
     maskProxyUrl,
+    emitGithubMask,
     loadProxies,
     selectRandomProxy,
     proxyKey,

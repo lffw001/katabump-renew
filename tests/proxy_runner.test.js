@@ -19,6 +19,7 @@ function tests() {
     assert.strictEqual(typeof mod.parseProxyLine, 'function');
     assert.strictEqual(typeof mod.buildHttpProxy, 'function');
     assert.strictEqual(typeof mod.maskProxyUrl, 'function');
+    assert.strictEqual(typeof mod.emitGithubMask, 'function');
     assert.strictEqual(typeof mod.loadProxies, 'function');
     assert.strictEqual(typeof mod.selectRandomProxy, 'function');
     assert.strictEqual(typeof mod.proxyKey, 'function');
@@ -44,6 +45,10 @@ function tests() {
         {
             line: '1.2.3.4:8080',
             expect: { ip: '1.2.3.4', port: '8080', username: '', password: '', valid: true }
+        },
+        {
+            line: 'host:80',
+            expect: { ip: 'host', port: '80', username: '', password: '', valid: true }
         },
         {
             line: '1.2.3.4:0',
@@ -114,6 +119,10 @@ function tests() {
             expect: { valid: false, reason: 'invalid_host' }
         },
         {
+            line: 'foo@bar:8080',
+            expect: { valid: false, reason: 'invalid_host' }
+        },
+        {
             line: 'bad%host:8080',
             expect: { ip: 'bad%host', port: '8080', username: '', password: '', valid: true, builds: false }
         },
@@ -146,6 +155,21 @@ function tests() {
     const masked = mod.maskProxyUrl('http://myuser:mypass@1.2.3.4:8080');
     assert.ok(!masked.includes('myuser'), 'masked url must not include username');
     assert.ok(!masked.includes('mypass'), 'masked url must not include password');
+
+    const maskedDefaultPort = mod.maskProxyUrl('http://myuser:mypass@host:80');
+    assert.strictEqual(maskedDefaultPort, 'http://***:***@host:80');
+
+    assert.strictEqual(
+        mod.buildHttpProxy({ valid: true, ip: 'foo@bar', port: '8080', username: '', password: '' }),
+        null,
+        'host containing @ must not be reinterpreted as URL credentials'
+    );
+
+    const localMaskOutput = [];
+    mod.emitGithubMask('http://user:pass@host:8080', { GITHUB_ACTIONS: 'false' }, line => localMaskOutput.push(line));
+    assert.deepStrictEqual(localMaskOutput, [], 'local runs must not print GitHub mask commands');
+    mod.emitGithubMask('http://user:pass@host:8080', { GITHUB_ACTIONS: 'true' }, line => localMaskOutput.push(line));
+    assert.deepStrictEqual(localMaskOutput, ['::add-mask::http://user:pass@host:8080']);
 
     const selected = mod.selectRandomProxy([mod.parseProxyLine('1.2.3.4:8080:user:pass')], {});
     assert.ok(selected, 'selectRandomProxy should return parsed object');

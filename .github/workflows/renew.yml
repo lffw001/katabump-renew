@@ -24,8 +24,14 @@ jobs:
       with:
         node-version: '24'
 
+    - name: Install dependencies
+      run: npm install
+
     - name: Syntax and unit checks
       run: npm run check
+
+    - name: Load runtime dependencies
+      run: node -e "require('axios'); require('playwright-extra'); require('puppeteer-extra-plugin-stealth')"
 
   renew:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
