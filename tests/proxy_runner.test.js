@@ -26,6 +26,7 @@ function tests() {
     assert.strictEqual(typeof mod.getMaxProxyAttempts, 'function');
     assert.strictEqual(typeof mod.calculateCooldownUntil, 'function');
     assert.strictEqual(typeof mod.loadCooldowns, 'function');
+    assert.strictEqual(typeof mod.isRealProxyNetworkFailure, 'function');
     assert.strictEqual(typeof mod.proxyKey, 'function');
     assert.strictEqual(typeof mod.safeProxyId, 'function');
 
@@ -207,6 +208,40 @@ function tests() {
     const successSummary = mod.buildFinalSummary(0, successAttempt, [retryAttempt, successAttempt]);
     assert.strictEqual(successSummary.status, 'success');
     assert.strictEqual(successSummary.screenshotPath, 'screenshots/success_after_2.png');
+
+    const proxyFailureAttempts = Array.from({ length: 10 }, (_, index) => ({
+        attempt: index + 1,
+        proxy: `proxy-${index + 1}`,
+        code: 42,
+        status: 'proxy_retry',
+        message: 'network failure',
+        screenshotPath: `screenshots/retry-${index + 1}.png`,
+        accounts: []
+    }));
+    assert.strictEqual(mod.isRealProxyNetworkFailure(proxyFailureAttempts[0]), true);
+    assert.strictEqual(mod.isRealProxyNetworkFailure({ ...proxyFailureAttempts[0], status: 'login_captcha_required' }), false);
+    const directNotReady = {
+        attempt: 11,
+        proxy: 'direct',
+        directFallback: true,
+        code: 3,
+        status: 'not_ready',
+        message: 'not ready',
+        screenshotPath: 'screenshots/direct-not-ready.png',
+        accounts: [{ status: 'not_ready' }]
+    };
+    const directSummary = mod.buildFinalSummary(0, directNotReady, [...proxyFailureAttempts, directNotReady], 10);
+    const directMessage = mod.formatFinalNotification(directSummary);
+    assert.strictEqual(directSummary.proxyAttempts, 10);
+    assert.strictEqual(directSummary.directFallbackAttempted, true);
+    assert.strictEqual(directSummary.totalAttempts, 11);
+    assert.ok(directMessage.includes('代理尝试：10/10'));
+    assert.ok(directMessage.includes('直连 fallback：已执行'));
+    assert.ok(!directMessage.includes('11/10'));
+
+    const directFailure = { ...directNotReady, code: 1, status: 'error', message: 'direct failed' };
+    const directFailureSummary = mod.buildFinalSummary(1, directFailure, [...proxyFailureAttempts, directFailure], 10);
+    assert.ok(mod.formatFinalNotification(directFailureSummary).includes('直连 fallback：失败'));
 
     const exhaustedAttempts = [
         retryAttempt,

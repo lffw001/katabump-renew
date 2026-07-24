@@ -96,6 +96,21 @@ function actionStatusFromCode(code) {
     }
 }
 
+function normalizeFinalCode(code) {
+    return code === EXIT_CODE.NOT_READY || code === EXIT_CODE.ALREADY_RENEWED
+        ? EXIT_CODE.SUCCESS
+        : code;
+}
+
+function isRealProxyNetworkFailure(attempt) {
+    return Boolean(
+        attempt &&
+        attempt.proxy !== 'direct' &&
+        attempt.code === EXIT_CODE.PROXY_RETRY &&
+        attempt.status === 'proxy_retry'
+    );
+}
+
 function makeAttemptRecord(attempt, parsed, childResult) {
     const actionResult = childResult.actionResult || {};
     const code = Number.isInteger(actionResult.exitCode) ? actionResult.exitCode : childResult.code;
@@ -115,6 +130,9 @@ function makeAttemptRecord(attempt, parsed, childResult) {
 function buildFinalSummary(finalCode, finalResult, attempts, maxAttempts = attempts.length) {
     const lastAttempt = attempts.length > 0 ? attempts[attempts.length - 1] : null;
     const actionResult = finalResult || lastAttempt || {};
+    const directFallbackRecord = attempts.find(attempt => attempt.directFallback === true) || null;
+    const proxyAttempts = attempts.filter(attempt => attempt.proxy !== 'direct').length;
+    const directFallbackAttempted = Boolean(directFallbackRecord);
     let status = actionResult.status || actionStatusFromCode(finalCode);
     if (finalCode === EXIT_CODE.NO_PROXY_AVAILABLE) status = 'no_proxy_available';
     if (finalCode === EXIT_CODE.FATAL && attempts.length > 0 && attempts.every(item => item.code === EXIT_CODE.PROXY_RETRY)) {
@@ -139,6 +157,12 @@ function buildFinalSummary(finalCode, finalResult, attempts, maxAttempts = attem
         htmlPath: actionResult.htmlPath || (lastAttempt && lastAttempt.htmlPath) || null,
         attempts,
         maxAttempts,
+        proxyAttempts,
+        directFallbackAttempted,
+        directFallbackSucceeded: directFallbackRecord
+            ? ['success', 'not_ready', 'already_renewed'].includes(directFallbackRecord.status)
+            : false,
+        totalAttempts: attempts.length,
         accounts,
         counts
     };
@@ -159,8 +183,13 @@ function formatFinalNotification(summary) {
     const lines = [
         titles[summary.status] || titles.error,
         '',
-        `代理尝试：${summary.attempts.length}/${summary.maxAttempts}`
+        `代理尝试：${summary.proxyAttempts}/${summary.maxAttempts}`
     ];
+    if (summary.directFallbackAttempted) {
+        lines.push(`直连 fallback：${summary.directFallbackSucceeded ? '已执行' : '失败'}`);
+    } else if (summary.proxyAttempts === 0 && summary.totalAttempts > 0) {
+        lines.push('运行模式：直连');
+    }
     if (summary.accounts.length > 0) {
         lines.push(`账号总数：${summary.accounts.length}`);
         lines.push(`成功：${summary.counts.success}`);
@@ -568,8 +597,22 @@ async function runProxyWorkflow(attempts) {
     const candidates = buildProxyCandidateQueue(proxies, cooldowns, attemptedProxyKeys);
     const maxAttempts = proxies.length > 0
         ? getMaxProxyAttempts(candidates.length)
-        : (proxyResult.configured ? 0 : 1);
+        : 0;
     console.log(`[proxy-runner] 有效代理 ${proxies.length} 条，冷却后候选 ${candidates.length} 条，本轮最多检查 ${maxAttempts} 条`);
+
+    let directFallbackAttempted = false;
+
+    if (!proxyResult.configured) {
+        const directResult = await runActionRenew(null, 1);
+        const directRecord = makeAttemptRecord(1, null, directResult);
+        attempts.push(directRecord);
+        return finalizeWorkflow(
+            normalizeFinalCode(directResult.code),
+            directResult.actionResult || directRecord,
+            attempts,
+            maxAttempts
+        );
+    }
 
     if (proxyResult.configured && proxies.length === 0) {
         console.log('[proxy-runner] proxies.txt 存在但无有效代理，禁止静默直连');
@@ -625,7 +668,7 @@ async function runProxyWorkflow(attempts) {
         // 3) 按退出码决定
         if (NON_RETRYABLE.has(code)) {
             // NOT_READY(3) 和 ALREADY_RENEWED(4) 是正常业务状态，归一为 0 避免 GitHub Actions 显示失败
-            const normalizedCode = (code === EXIT_CODE.NOT_READY || code === EXIT_CODE.ALREADY_RENEWED) ? EXIT_CODE.SUCCESS : code;
+            const normalizedCode = normalizeFinalCode(code);
             if (code !== normalizedCode) {
                 console.log(`[proxy-runner] 业务状态码 ${code} 归一为 ${normalizedCode}（正常业务，非失败）`);
             }
@@ -650,6 +693,28 @@ async function runProxyWorkflow(attempts) {
         // 未知退出码也停止（不是 PROXY_RETRY）
         console.log(`[proxy-runner] 未知退出码 ${code}，不换代理，停止`);
         return finalizeWorkflow(code, result.actionResult || attemptRecord, attempts, maxAttempts);
+    }
+
+    if (
+        !directFallbackAttempted &&
+        candidates.length === 0 &&
+        attempts.length > 0 &&
+        attempts.every(isRealProxyNetworkFailure)
+    ) {
+        directFallbackAttempted = true;
+        console.log('[proxy-runner] 所有代理网络故障，启用直连 fallback');
+
+        const directResult = await runActionRenew(null, attempts.length + 1);
+        const directRecord = makeAttemptRecord(attempts.length + 1, null, directResult);
+        directRecord.directFallback = true;
+        attempts.push(directRecord);
+
+        return finalizeWorkflow(
+            normalizeFinalCode(directResult.code),
+            directResult.actionResult || directRecord,
+            attempts,
+            maxAttempts
+        );
     }
 
     console.log(`[proxy-runner] 已尝试 ${maxAttempts} 个代理，均未成功`);
@@ -694,6 +759,8 @@ module.exports = {
     proxyKey,
     safeProxyId,
     parsePositiveNumber,
+    normalizeFinalCode,
+    isRealProxyNetworkFailure,
     getMaxProxyAttempts,
     buildProxyCandidateQueue,
     calculateCooldownUntil,
